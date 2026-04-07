@@ -238,8 +238,8 @@
     {"title": "Java's Cover", "slug": "javacover", "topic": "programming"},
     {"title": "Beating the Averages", "slug": "avg", "topic": "programming"},
     {"title": "Lisp for Web-Based Applications", "slug": "lwba", "topic": "programming"},
-    {"title": "Chapter 1 of Ansi Common Lisp", "slug": "acl1", "topic": "programming"},
-    {"title": "Chapter 2 of Ansi Common Lisp", "slug": "acl2", "topic": "programming"},
+    {"title": "Chapter 1 of Ansi Common Lisp", "slug": "acl1", "topic": "programming", "skip": true, "skip_reason": "landing page only, no essay content"},
+    {"title": "Chapter 2 of Ansi Common Lisp", "slug": "acl2", "topic": "programming", "skip": true, "skip_reason": "landing page only, no essay content"},
     {"title": "Programming Bottom-Up", "slug": "progbot", "topic": "programming"},
     {"title": "This Year We Can End the Death Penalty in California", "slug": "prop62", "topic": "life"}
   ]

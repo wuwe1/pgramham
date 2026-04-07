@@ -42,14 +42,26 @@ def get_client() -> httpx.Client:
 def fetch_essay(client: httpx.Client, slug: str) -> tuple[str, list[dict]]:
     """Fetch an essay and return (html_content, images_info)."""
     ext = ".txt" if slug in ("acl1", "acl2") else ".html"
-    url = urljoin(BASE_URL, slug + ext)
+    url = BASE_URL + slug + ext
     resp = client.get(url)
     resp.raise_for_status()
     return resp.text, url
 
 
+SKIP_IMAGE_PATTERNS = {
+    "spacer", "beacon", "pixel", "track", "blank",
+    "virtumundo", "doubleclick", "googlesyndication",
+}
+
+
+def should_skip_image(url: str, filename: str) -> bool:
+    """Skip tracking pixels, spacers, and external junk images."""
+    lower = url.lower() + filename.lower()
+    return any(p in lower for p in SKIP_IMAGE_PATTERNS)
+
+
 def extract_images(soup: BeautifulSoup, page_url: str) -> list[dict]:
-    """Extract image URLs from the page."""
+    """Extract meaningful image URLs from the page."""
     images = []
     for img in soup.find_all("img"):
         src = img.get("src")
@@ -57,6 +69,9 @@ def extract_images(soup: BeautifulSoup, page_url: str) -> list[dict]:
             continue
         abs_url = urljoin(page_url, src)
         filename = Path(src).name
+        if should_skip_image(abs_url, filename):
+            img.decompose()  # remove junk images from DOM
+            continue
         images.append({"url": abs_url, "filename": filename})
     return images
 
@@ -76,38 +91,83 @@ def download_image(client: httpx.Client, url: str, filename: str) -> str | None:
         return None
 
 
+def fix_br_tags(html: str) -> str:
+    """Fix PG's malformed <br><br/> sequences before parsing.
+
+    PG's HTML uses patterns like <br><br/> which causes html.parser to
+    nest all subsequent content inside the first <br> tag. We normalize
+    them all to <br/> so BeautifulSoup treats them as self-closing.
+    """
+    html = re.sub(r"<br\s*>", "<br/>", html)
+    return html
+
+
+def find_essay_content(soup: BeautifulSoup) -> BeautifulSoup:
+    """Extract the main essay content from PG's table-based layout.
+
+    PG's site uses nested <table> elements for layout. The essay text is
+    typically inside the largest <font> tag or the <td> with the most text.
+    """
+    # Strategy 1: find the <font> tag with the most text (works for most essays)
+    fonts = soup.find_all("font")
+    if fonts:
+        best = max(fonts, key=lambda f: len(f.get_text()))
+        if len(best.get_text()) > 100:
+            return best
+
+    # Strategy 2: find the <td> with the most text
+    tds = soup.find_all("td")
+    if tds:
+        best = max(tds, key=lambda t: len(t.get_text()))
+        if len(best.get_text()) > 100:
+            return best
+
+    # Fallback: use body
+    return soup.find("body") or soup
+
+
 def html_to_markdown(html: str, page_url: str, client: httpx.Client) -> str:
     """Convert essay HTML to clean markdown, downloading images."""
+    html = fix_br_tags(html)
     soup = BeautifulSoup(html, "html.parser")
 
-    # PG's essays are usually in a <table> layout, find the main text
-    # Try to find the essay content - usually in the largest <font> or <td> block
-    body = soup.find("body")
-    if not body:
-        body = soup
+    # Remove script/style tags first
+    for tag in soup.find_all(["script", "style"]):
+        tag.decompose()
+
+    # Extract the actual essay content (not the layout tables)
+    content_el = find_essay_content(soup)
 
     # Download images and rewrite src to local paths
-    images = extract_images(soup, page_url)
+    images = extract_images(content_el, page_url)
     for img_info in images:
         local_path = download_image(client, img_info["url"], img_info["filename"])
         if local_path:
-            for img_tag in body.find_all("img", src=True):
+            for img_tag in content_el.find_all("img", src=True):
                 if img_info["filename"] in img_tag["src"]:
                     img_tag["src"] = f"../../{local_path}"
 
-    # Convert to markdown
-    content = md(str(body), heading_style="ATX", strip=["script", "style"])
+    # Unwrap layout tables inside the content to avoid markdown table noise
+    for table in content_el.find_all("table"):
+        table.unwrap()
+    for tag in content_el.find_all(["tr", "td", "tbody"]):
+        tag.unwrap()
 
-    # Clean up excessive whitespace
-    content = re.sub(r"\n{3,}", "\n\n", content)
+    # Convert to markdown
+    content = md(
+        str(content_el),
+        heading_style="ATX",
+        strip=["font"],
+    )
+
+    # Clean up
+    content = re.sub(r"\n{3,}", "\n\n", content)           # excess blank lines
+    content = re.sub(r"[ \t]+\n", "\n", content)            # trailing whitespace
+    content = re.sub(r"\|\s*\|[\s|]*", "", content)         # leftover table pipes
+    content = re.sub(r"---+\s*\n\s*---+", "---", content)  # duplicate hr
     content = content.strip()
 
     return content
-
-
-def txt_to_markdown(text: str) -> str:
-    """Convert plain text essay to markdown."""
-    return text.strip()
 
 
 def save_essay(title: str, slug: str, topic: str, content: str) -> Path:
@@ -161,6 +221,12 @@ def scrape_all():
             slug = essay["slug"]
             topic = essay.get("topic")
 
+            # Skip entries marked as skip
+            if essay.get("skip"):
+                stats["skipped"] += 1
+                progress.update(task, advance=1, description=f"[dim]Skip: {title}[/dim]")
+                continue
+
             # Check if already scraped
             if topic:
                 dest = TOPICS_DIR / topic / f"{slug}.md"
@@ -176,10 +242,7 @@ def scrape_all():
             try:
                 html, page_url = fetch_essay(client, slug)
 
-                if slug in ("acl1", "acl2"):
-                    content = txt_to_markdown(html)
-                else:
-                    content = html_to_markdown(html, page_url, client)
+                content = html_to_markdown(html, page_url, client)
 
                 if topic:
                     save_essay(title, slug, topic, content)
@@ -204,11 +267,78 @@ def scrape_all():
                   f"Failed: {stats['failed']}")
 
 
+MIN_CONTENT_LENGTH = 200  # essays shorter than this are likely broken
+
+
+def validate():
+    """Validate scraped essays for quality issues."""
+    data = load_essays()
+    essays = data["essays"]
+    issues = []
+
+    for essay in essays:
+        if essay.get("skip"):
+            continue
+        title = essay["title"]
+        slug = essay["slug"]
+        topic = essay.get("topic")
+
+        if topic:
+            path = TOPICS_DIR / topic / f"{slug}.md"
+        else:
+            path = BACKLOGS_DIR / f"{slug}.md"
+
+        if not path.exists():
+            issues.append(f"[red]MISSING[/red]  {title} ({path})")
+            continue
+
+        content = path.read_text(encoding="utf-8")
+        # Strip the header (title + source + hr) to measure actual content
+        parts = content.split("---\n\n", 1)
+        body = parts[1] if len(parts) > 1 else content
+        body_len = len(body.strip())
+
+        if body_len < MIN_CONTENT_LENGTH:
+            issues.append(f"[yellow]SHORT[/yellow]   {title}: {body_len} chars ({path})")
+
+        if "| --- |" in body or body.count("| |") > 3:
+            issues.append(f"[yellow]TABLES[/yellow]  {title}: leftover table markup ({path})")
+
+        # Check for broken image refs
+        for match in re.finditer(r"!\[.*?\]\((.*?)\)", body):
+            img_path = ROOT / match.group(1).lstrip("../../")
+            if not img_path.exists() and not match.group(1).startswith("http"):
+                issues.append(f"[yellow]IMG[/yellow]     {title}: missing {match.group(1)}")
+
+    if issues:
+        console.print(f"\n[bold]Found {len(issues)} issues:[/bold]")
+        for issue in issues:
+            console.print(f"  {issue}")
+    else:
+        console.print("[green]All essays passed validation![/green]")
+
+    # Stats
+    total = sum(1 for e in essays if not e.get("skip"))
+    existing = sum(1 for e in essays if not e.get("skip") and (
+        (TOPICS_DIR / e.get("topic", "") / f"{e['slug']}.md").exists() if e.get("topic")
+        else (BACKLOGS_DIR / f"{e['slug']}.md").exists()
+    ))
+    console.print(f"\nScraped: {existing}/{total} essays")
+
+    return len(issues) == 0
+
+
 def main():
-    console.print("[bold]Paul Graham Essay Scraper[/bold]")
-    console.print(f"Output: {ROOT}")
-    console.print()
-    scrape_all()
+    import sys
+    if "--validate" in sys.argv:
+        console.print("[bold]Validating scraped essays...[/bold]")
+        ok = validate()
+        sys.exit(0 if ok else 1)
+    else:
+        console.print("[bold]Paul Graham Essay Scraper[/bold]")
+        console.print(f"Output: {ROOT}")
+        console.print()
+        scrape_all()
 
 
 if __name__ == "__main__":
