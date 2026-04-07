@@ -88,7 +88,7 @@ def reassemble(slug: str) -> bool:
         return False
 
     # Check all chunks are translated
-    total_chunks = len(list(chunk_dir.glob("chunk_*.txt")))
+    total_chunks = len([p for p in chunk_dir.glob("chunk_*.txt") if "_zh" not in p.name])
     translated_chunks = len(list(chunk_dir.glob("chunk_*_zh.txt")))
     if translated_chunks < total_chunks:
         print(f"  {slug}: {translated_chunks}/{total_chunks} chunks translated")
